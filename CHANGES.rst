@@ -13,6 +13,10 @@ Unreleased
 -   Use modern packaging metadata with ``pyproject.toml`` instead of ``setup.cfg``.
     :pr:`1793`
 -   Use ``flit_core`` instead of ``setuptools`` as build backend.
+-   A name that is assigned by every branch of an ``{% if %}`` chain ending
+    in ``{% else %}`` is tracked as assigned, so
+    ``meta.find_undeclared_variables`` no longer reports it, unless the name
+    is read before it is assigned. :issue:`2069`
 
 
 Version 3.1.6

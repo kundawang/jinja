@@ -179,6 +179,49 @@ class TestMeta:
         x = meta.find_undeclared_variables(ast)
         assert x == {"foo"}
 
+    @pytest.mark.parametrize(
+        ("source", "expect"),
+        [
+            # Every branch assigns the name before reading it, and the chain
+            # always runs one of them, so it is never read from the context.
+            pytest.param(
+                "{% if a %}{% set x = 1 %}{% else %}{% set x = 2 %}{% endif %}{{ x }}",
+                {"a"},
+                id="if-else",
+            ),
+            pytest.param(
+                "{% if a %}{% set x = 1 %}"
+                "{% elif b %}{% set x = 2 %}"
+                "{% else %}{% set x = 3 %}{% endif %}{{ x }}",
+                {"a", "b"},
+                id="if-elif-else",
+            ),
+            # Without an else branch the name may never be assigned.
+            pytest.param(
+                "{% if a %}{% set x = 1 %}{% endif %}{{ x }}", {"a", "x"}, id="no-else"
+            ),
+            # A branch reads the name before assigning it, so the outer value
+            # is still needed.
+            pytest.param(
+                "{% if a %}{{ x.y }}{% set x = 1 %}"
+                "{% else %}{% set x = 2 %}{% endif %}{{ x }}",
+                {"a", "x"},
+                id="read-before-assign",
+            ),
+            # A read in a nested scope is not part of the frame's symbols,
+            # but it still reads the name from the context.
+            pytest.param(
+                "{% for i in a %}{{ x }}{% endfor %}"
+                "{% if a %}{% set x = 1 %}"
+                "{% else %}{% set x = 2 %}{% endif %}{{ x }}",
+                {"a", "x"},
+                id="read-in-nested-scope",
+            ),
+        ],
+    )
+    def test_find_undeclared_variables_if_branches(self, env, source, expect):
+        assert meta.find_undeclared_variables(env.parse(source)) == expect
+
     def test_find_refererenced_templates(self, env):
         ast = env.parse('{% extends "layout.html" %}{% include helper %}')
         i = meta.find_referenced_templates(ast)

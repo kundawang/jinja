@@ -1,3 +1,4 @@
+import itertools
 import typing as t
 
 from . import nodes
@@ -28,6 +29,17 @@ def symbols_for_node(
     sym = Symbols(parent=parent_symbols)
     sym.analyze_node(node)
     return sym
+
+
+def _defines_local(symbols: "Symbols", name: str) -> bool:
+    """Whether ``symbols`` introduced ``name`` as a new local, assigning it
+    before any read.
+
+    If the name was read first, or an outer scope already defines it, the
+    outer value is still needed and must be loaded. See issue :issue:`1253`.
+    """
+    ref = symbols.refs.get(name)
+    return ref is not None and symbols.loads.get(ref) == (VAR_LOAD_UNDEFINED, None)
 
 
 class Symbols:
@@ -118,13 +130,39 @@ class Symbols:
         if self.find_ref(name) is None:
             self._define_ref(name, load=(VAR_LOAD_RESOLVE, name))
 
-    def branch_update(self, branch_symbols: t.Sequence["Symbols"]) -> None:
+    def branch_update(
+        self,
+        branch_symbols: t.Sequence["Symbols"],
+        *,
+        exhaustive: bool = False,
+        inner_loads: t.Collection[str] = (),
+    ) -> None:
+        """Merge the symbols of a set of mutually exclusive branches.
+
+        :param branch_symbols: The symbols collected for each branch.
+        :param exhaustive: Whether the branches cover every possible path,
+            such as an ``{% if %}`` chain ending in ``{% else %}``. If they
+            do, a name that every branch assigns before reading does not
+            need to be resolved from the outer scope.
+        :param inner_loads: Names read inside nested scopes, which may be
+            read before a branch assigns them.
+        """
         stores: set[str] = set()
 
         for branch in branch_symbols:
             stores.update(branch.stores)
 
         stores.difference_update(self.stores)
+
+        if exhaustive:
+            # A name assigned by every branch is always defined afterwards,
+            # so it does not need to be resolved from the outer scope.
+            stores -= {
+                name
+                for name in stores
+                if name not in inner_loads
+                and all(_defines_local(branch, name) for branch in branch_symbols)
+            }
 
         for sym in branch_symbols:
             self.refs.update(sym.refs)
@@ -232,6 +270,46 @@ class FrameSymbolVisitor(NodeVisitor):
 
     def __init__(self, symbols: "Symbols") -> None:
         self.symbols = symbols
+        # Scopes this visitor stops at, in the order they appear. They are
+        # only scanned if `visit_If` asks for the names they read, so a
+        # template without an if/else chain does no extra work.
+        self._inner_scopes: list[nodes.Node] = []
+        self._inner_loads: set[str] = set()
+
+    def _track_inner_loads(
+        self, *groups: "nodes.Node | t.Iterable[nodes.Node] | None"
+    ) -> None:
+        """Remember a scope this visitor does not enter.
+
+        Every field the compiler visits with a child frame must be passed
+        here, even if the field is also visited into this frame's symbols.
+        A read in such a field is not part of this frame's symbols, but it
+        still reads this frame's variables, so :meth:`visit_If` needs to
+        know about it.
+        """
+        for group in groups:
+            if group is None:
+                continue
+
+            if isinstance(group, nodes.Node):
+                self._inner_scopes.append(group)
+            else:
+                self._inner_scopes.extend(group)
+
+    def _get_inner_loads(self) -> set[str]:
+        """The names read so far inside scopes this visitor does not enter."""
+        while self._inner_scopes:
+            node = self._inner_scopes.pop()
+
+            # ``find_all`` only yields descendants, so check the node itself
+            # as well. A field such as ``For.test`` may be a bare ``Name``.
+            for child in itertools.chain((node,), node.find_all(nodes.Node)):
+                if isinstance(child, nodes.NSRef):
+                    self._inner_loads.add(child.name)
+                elif isinstance(child, nodes.Name) and child.ctx == "load":
+                    self._inner_loads.add(child.name)
+
+        return self._inner_loads
 
     def visit_Name(
         self, node: nodes.Name, store_as_param: bool = False, **kwargs: t.Any
@@ -260,13 +338,35 @@ class FrameSymbolVisitor(NodeVisitor):
             self.symbols = original_symbols
             return rv
 
-        body_symbols = inner_visit(node.body)
-        elif_symbols = inner_visit(node.elif_)
-        else_symbols = inner_visit(node.else_ or ())
-        self.symbols.branch_update([body_symbols, elif_symbols, else_symbols])
+        # The parser produces a flat chain: every `elif` is an `If` node in
+        # `elif_` with an empty `elif_`/`else_`, and the final `else` body
+        # is stored on the outermost node. Track each body as its own
+        # branch so that a name assigned by all of them can be recognised.
+        branch_symbols = [inner_visit(node.body)]
+        exhaustive = bool(node.else_)
+
+        for elif_node in node.elif_:
+            if elif_node.elif_ or elif_node.else_:
+                # Not a shape the parser produces. Visit it as a whole and
+                # make no assumptions about which paths assign a name.
+                branch_symbols.append(inner_visit([elif_node]))
+                exhaustive = False
+            else:
+                branch_symbols.append(inner_visit([elif_node.test, *elif_node.body]))
+
+        branch_symbols.append(inner_visit(node.else_ or ()))
+        # A name read inside a nested scope, either before this statement or
+        # within a branch, may be read before the branch assigns it, so the
+        # outer value is still needed.
+        self.symbols.branch_update(
+            branch_symbols,
+            exhaustive=exhaustive,
+            inner_loads=self._get_inner_loads() if exhaustive else (),
+        )
 
     def visit_Macro(self, node: nodes.Macro, **kwargs: t.Any) -> None:
         self.symbols.store(node.name)
+        self._track_inner_loads(node.body, node.defaults)
 
     def visit_Import(self, node: nodes.Import, **kwargs: t.Any) -> None:
         self.generic_visit(node, **kwargs)
@@ -291,26 +391,42 @@ class FrameSymbolVisitor(NodeVisitor):
         is visited as part of the outer scope.
         """
         self.visit(node.iter, **kwargs)
+        self._track_inner_loads(node.body, node.else_, node.test)
 
     def visit_CallBlock(self, node: nodes.CallBlock, **kwargs: t.Any) -> None:
         self.visit(node.call, **kwargs)
+        self._track_inner_loads(node.body, node.defaults)
 
     def visit_FilterBlock(self, node: nodes.FilterBlock, **kwargs: t.Any) -> None:
         self.visit(node.filter, **kwargs)
+        # `filter` is visited above so that it resolves in this frame, but
+        # the compiler evaluates it in a child frame, so it is tracked too.
+        self._track_inner_loads(node.body, node.filter)
 
     def visit_With(self, node: nodes.With, **kwargs: t.Any) -> None:
         for target in node.values:
             self.visit(target)
 
+        self._track_inner_loads(node.body)
+
     def visit_AssignBlock(self, node: nodes.AssignBlock, **kwargs: t.Any) -> None:
         """Stop visiting at block assigns."""
         self.visit(node.target, **kwargs)
+        self._track_inner_loads(node.body, node.filter)
 
     def visit_Scope(self, node: nodes.Scope, **kwargs: t.Any) -> None:
         """Stop visiting at scopes."""
+        self._track_inner_loads(node.body)
 
     def visit_Block(self, node: nodes.Block, **kwargs: t.Any) -> None:
         """Stop visiting at blocks."""
+        # A block body gets a fresh root frame, so it cannot read this
+        # frame's variables. It is tracked anyway rather than relying on
+        # that.
+        self._track_inner_loads(node.body)
 
     def visit_OverlayScope(self, node: nodes.OverlayScope, **kwargs: t.Any) -> None:
         """Do not visit into overlay scopes."""
+        # `context` is evaluated in this frame but is never visited. The
+        # body is isolated, and is tracked only to be safe.
+        self._track_inner_loads(node.context, node.body)

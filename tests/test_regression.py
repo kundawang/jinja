@@ -760,6 +760,18 @@ def test_load_parameter_when_set_in_all_if_branches(env):
     assert tmpl.render(a={"b": 0}) == "01"
 
 
+def test_set_same_parameter_in_all_if_branches(env):
+    tmpl = env.from_string(
+        "{% if a == 1 %}{% set a = 'x' %}"
+        "{% elif a == 2 %}{% set a = 'y' %}"
+        "{% else %}{% set a = 'z' %}{% endif %}"
+        "{{ a }}"
+    )
+    assert tmpl.render(a=1) == "x"
+    assert tmpl.render(a=2) == "y"
+    assert tmpl.render(a=3) == "z"
+
+
 @pytest.mark.parametrize("unicode_char", ["\N{FORM FEED}", "\x85"])
 def test_unicode_whitespace(env, unicode_char):
     content = "Lorem ipsum\n" + unicode_char + "\nMore text"
